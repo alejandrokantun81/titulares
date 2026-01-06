@@ -9,49 +9,57 @@ st.markdown("""
 <style>
     .stContainer {border-radius: 10px;}
     div[data-testid="stMetricValue"] {font-size: 1.1rem;}
+    .cat-item {
+        background-color: #f1f5f9;
+        padding: 4px 8px;
+        border-radius: 4px;
+        margin-bottom: 4px;
+        font-size: 0.85em;
+        font-family: monospace;
+        color: #334155;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# 1. CARGA DE DATOS (LECTURA DIRECTA DE EXCEL)
+# 1. CARGA DE DATOS
 @st.cache_data
 def cargar_datos():
     archivo = 'DZITAS TITULARES 2025B.xlsx'
     
     try:
-        # Leemos el Excel directamente. 
-        # header=5 porque la fila de títulos ("ID DEL DOCENTE"...) está en la fila 6 (índice 5)
-        # sheet_name=None lee todas, pero especificamos 'PLANTILLA TIT' o leemos la activa (0)
-        # Probamos leer la hoja específica primero
+        # Intentamos leer la hoja específica
         try:
             df = pd.read_excel(archivo, sheet_name='PLANTILLA TIT', header=5, engine='openpyxl')
         except:
-            # Si falla el nombre de la hoja, leemos la primera hoja disponible
             df = pd.read_excel(archivo, header=5, engine='openpyxl')
             
     except FileNotFoundError:
         return None
 
     # LIMPIEZA DE DATOS
+    
+    # A) Columnas que SÍ deben rellenarse hacia abajo (Datos fijos del docente)
     cols_identidad = [
         'ID DEL DOCENTE', 'APELLIDO PATERNO', 'APELLIDO MATERNO', 'NOMBRE (S)',
         'NÓMINA', 'HRS PLAZA/BASE', 'HRS CONTRATO', 'INFORMACIÓN ACADÉMICA '
     ]
     
-    # Rellenar hacia abajo (Forward Fill)
-    # Verificamos que las columnas existan antes de procesar
+    # Verificamos que existan
     cols_existentes = [c for c in cols_identidad if c in df.columns]
     if cols_existentes:
         df[cols_existentes] = df[cols_existentes].ffill()
     
-    # Crear Nombre Completo
+    # B) Crear Nombre Completo
     df['DOCENTE'] = df['NOMBRE (S)'].fillna('') + ' ' + df['APELLIDO PATERNO'].fillna('') + ' ' + df['APELLIDO MATERNO'].fillna('')
     
-    # Convertir números
+    # C) Convertir números (limpieza básica)
     cols_numericas = ['HRS. POR UAC/ASIG', 'NÓMINA', 'HRS PLAZA/BASE', 'HRS CONTRATO']
     for col in cols_numericas:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+    # NOTA: NO rellenamos 'CATEGORÍAS/ NÓMINA' para poder leer los renglones individuales
+    
     return df
 
 df = cargar_datos()
@@ -62,7 +70,7 @@ if df is None:
 
 # 2. INTERFAZ DE AUDITORÍA
 st.title("🛡️ Sistema de Control de Plazas")
-st.markdown(f"**Archivo cargado:** `DZITAS TITULARES 2025B.xlsx`")
+st.markdown(f"**Archivo activo:** `DZITAS TITULARES 2025B.xlsx`")
 
 # Filtros
 col_search, col_filter = st.columns([2, 1])
@@ -71,25 +79,32 @@ filtro_status = col_filter.selectbox("Estado", ["Todos", "✅ Coherente", "❌ E
 
 # Procesamiento Lógico
 if 'ID DEL DOCENTE' in df.columns:
-    docentes_unicos = df['ID DEL DOCENTE'].unique()
+    docentes_unicos = df['ID DEL DOCENTE'].dropna().unique()
     docentes_filtrados = []
 
     for doc_id in docentes_unicos:
-        # Datos del docente
+        # Obtenemos TODAS las filas de este docente (incluso las que no tienen materia pero tienen categoría)
         sub_df = df[df['ID DEL DOCENTE'] == doc_id]
         if sub_df.empty: continue
         
         primer = sub_df.iloc[0]
         
-        # CÁLCULOS
+        # 1. Extraer desglose de Categorías (NUEVO)
+        # Tomamos la columna, quitamos vacíos, convertimos a texto y quitamos duplicados
+        if 'CATEGORÍAS/ NÓMINA' in sub_df.columns:
+            lista_categorias = sub_df['CATEGORÍAS/ NÓMINA'].dropna().astype(str).unique().tolist()
+        else:
+            lista_categorias = ["Sin datos"]
+
+        # 2. Cálculos Numéricos
         capacidad_nomina = primer.get('NÓMINA', 0)
         
-        # Materias reales
+        # Materias reales (filas que sí tienen nombre de materia)
         materias = sub_df.dropna(subset=['UNIDAD DE APRENDIZAJE CURRICULAR/ASIGNATURA'])
         carga_asignada = materias['HRS. POR UAC/ASIG'].sum()
         
-        # VALIDACIÓN (SEMÁFORO)
-        es_excedido = carga_asignada > (capacidad_nomina + 0.1) # Margen de tolerancia 0.1
+        # 3. Validación
+        es_excedido = carga_asignada > (capacidad_nomina + 0.1)
         
         # Objeto Docente
         d = {
@@ -100,7 +115,8 @@ if 'ID DEL DOCENTE' in df.columns:
             "contrato": primer.get('HRS CONTRATO', 0),
             "carga": carga_asignada,
             "es_excedido": es_excedido,
-            "materias": materias
+            "materias": materias,
+            "desglose_categorias": lista_categorias # Guardamos la lista
         }
         
         # Filtrado
@@ -120,12 +136,12 @@ if 'ID DEL DOCENTE' in df.columns:
     
     st.divider()
 
-    # TARJETAS
+    # RENDERIZADO DE TARJETAS
     cols = st.columns(2)
     for i, doc in enumerate(docentes_filtrados):
         with cols[i % 2]:
-            borde = "red" if doc['es_excedido'] else "green"
             with st.container(border=True):
+                # Encabezado
                 c1, c2 = st.columns([3,1])
                 c1.markdown(f"**{doc['nombre']}**")
                 if doc['es_excedido']:
@@ -133,16 +149,34 @@ if 'ID DEL DOCENTE' in df.columns:
                 else:
                     c2.success("OK")
                 
+                st.caption(f"ID: {int(doc['id'])}")
+                
+                # --- NUEVO: MENÚ DESPLEGABLE DE CATEGORÍAS ---
+                with st.expander("📂 Ver Desglose de Plazas (Categorías)"):
+                    if doc['desglose_categorias']:
+                        for cat in doc['desglose_categorias']:
+                            # Renderizamos cada categoría como un pequeño bloque
+                            st.markdown(f"<div class='cat-item'>{cat}</div>", unsafe_allow_html=True)
+                    else:
+                        st.text("No especificado")
+                # ---------------------------------------------
+
                 # Barra de comparación
-                st.caption(f"Capacidad Nómina: {int(doc['nomina'])} hrs")
-                st.progress(min(doc['carga'] / (doc['nomina'] if doc['nomina'] > 0 else 1), 1.0))
+                st.markdown(f"**Nómina Total:** {int(doc['nomina'])} hrs")
+                
+                # Lógica visual de barra de progreso
+                ratio = 0
+                if doc['nomina'] > 0:
+                    ratio = doc['carga'] / doc['nomina']
+                
+                st.progress(min(ratio, 1.0))
                 
                 if doc['es_excedido']:
-                    st.markdown(f":red[**Asignadas: {doc['carga']} hrs**] (Sobran {doc['carga']-doc['nomina']})")
+                    st.markdown(f":red[⚠️ **Asignadas: {doc['carga']} hrs**] (Excede por {doc['carga']-doc['nomina']})")
                 else:
-                    st.markdown(f":green[**Asignadas: {doc['carga']} hrs**]")
+                    st.markdown(f":green[**Asignadas: {doc['carga']} hrs**] (Disponible: {doc['nomina'] - doc['carga']})")
 
-                with st.expander("Ver Materias"):
+                with st.expander("Ver Materias Asignadas"):
                     st.dataframe(doc['materias'][['UNIDAD DE APRENDIZAJE CURRICULAR/ASIGNATURA', 'HRS. POR UAC/ASIG']], hide_index=True)
 else:
-    st.error("No encontré la columna 'ID DEL DOCENTE'. Revisa la fila de encabezados en el Excel.")
+    st.error("No encontré la columna 'ID DEL DOCENTE'. Revisa el archivo.")
